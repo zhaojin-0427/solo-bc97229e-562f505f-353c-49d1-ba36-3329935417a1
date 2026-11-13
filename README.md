@@ -23,7 +23,7 @@ docker compose up --build
 两个来源的完整轮次与合并目录。模拟数据中 B 的前 15 个 DOI 与 A 重复（但 DOI 写法、
 大小写和题名不同），用于演示去重与出处合并。
 
-一条命令走完「采集 → 断流续采 → 令牌失效重采 → 撤稿接替」演示：
+一条命令走完「采集 → 慢正文取消本轮 → 断流续采 → 令牌失效重采 → 撤稿接替」演示：
 
 ```bash
 ./demo.sh
@@ -47,6 +47,12 @@ docker compose up --build
 | 完整一轮后才替换该源目录 | 只有最后一页（无 resumptionToken）才在单事务内 `DELETE + INSERT` 本来源快照 |
 | 合并保留另一源同期更新 | 交换只按 `source_id` 删本来源行，另一来源目录原样保留 |
 | 查询只见完整状态 | 查询全部走正式目录 `catalog_records` / `merged_catalog`；半截数据只在 `staging_records` |
+| **取消本轮采集** | 控制台按「来源 + 轮次」取消；受理后阻止该轮发布并**立即硬中断在途 HTTP 响应**（socket shutdown，不等慢正文结束或读超时）；采集退出、暂存与令牌清理完成后才显示「已取消」 |
+| 取消与发布互斥 | `request_cancel` 与 `complete_round` 均为 `BEGIN IMMEDIATE` 写事务，SQLite 写锁保证只有一方先提交；发布先提交则取消被拒绝 |
+| 重复取消返回原结果 | 同一轮次的重复取消幂等返回（cancelling → cancelled）；旧页面的轮次号与新轮不匹配时拒绝（`rejected_stale_round`） |
+| 取消中拒绝同源启动 | `cancelling` 状态下启动返回 `cancelling`（HTTP 409）；收尾完成后可从首页新采；另一源采集与目录查询不受影响 |
+| 取消意图持久化 | `cancelling` 状态落库；清理期间进程重启会在启动时**继续完成取消**，绝不转成可续采的 error |
+| 迟到响应不改新轮 | 所有采集写入按「轮次 + running 状态」守卫：迟到的落盘/失败标记/发布一律丢弃 |
 | 逐页持久化记录与 resumptionToken，重启续采 | 每页一个短事务落盘记录、序号与令牌；进程重启后状态置为 error，点击续采从令牌页继续 |
 | badResumptionToken 清空本轮暂存从头重采 | `restart_from_beginning()`：删本轮 staging、round+1、令牌清空，正式目录不动；重采次数有上限保护 |
 | 网络失败可续采 | 网络异常只标记 `error/network`，已落盘的页与令牌保留，续采沿用同一 round |
@@ -63,7 +69,8 @@ docker compose up --build
 | `/catalog?q=&page=` | GET | DOI 目录检索（DOI 或题名关键词，DOI 不区分大小写、可带前缀） |
 | `/doi/<doi_key>` | GET | 单条 DOI 的全部出处、优先题名、撤稿状态 |
 | `/no-doi` | GET | 无 DOI 记录清单（保留但不参与合并） |
-| `/harvest/start` | POST | 表单 `source_id` 启动/续采单源；不带参数并行启动两源 |
+| `/harvest/start` | POST | 表单 `source_id` 启动/续采单源；不带参数并行启动两源；取消收尾中返回 409 |
+| `/harvest/cancel` | POST | 表单 `source_id` + `round_id` 取消指定轮次；重复取消返回原结果；发布已提交或轮次不匹配返回 409 |
 | `/api/sources` | GET | 两源采集状态 JSON |
 | `/api/stats` | GET | 目录统计 JSON |
 | `/api/catalog?q=&limit=&offset=` | GET | 合并目录 JSON |
@@ -78,6 +85,10 @@ docker compose up --build
   `badResumptionToken`，触发采集器清空本轮暂存并从首页重采；
 - **让令牌持续过期**：每次翻页都失败，用于观察重采上限保护与「旧目录不变」；
 - **让下一次翻页断流（HTTP 500）**：模拟网络中断，采集器停在 error 并保留断点，续采即可继续；
+- **让下一次响应慢正文 / 持续慢正文模式**：响应头立即返回，正文按 256 字节小块
+  滴流发送（默认每块 0.3s，可用 `--slow-chunk-seconds/--slow-chunk-bytes` 调整），
+  用于演示「取消立即中断在途响应，不等慢正文结束或读超时」；
+  也可用 `MOCK_SLOW_BODY=1 docker compose up` 让 mock 启动即进入持续慢正文模式；
 - **撤下 / 恢复记录**：按 OAI 标识注入或撤销 `status=deleted`；
 - **恢复数据集**：还原初始数据。
 
@@ -93,8 +104,20 @@ merged_catalog     合并视图：归一化 DOI 分组 + 优先来源题名 + �
 
 - 采集线程每个持有独立 SQLite 连接，WAL + `busy_timeout` 保证读写并发；
 - gunicorn 固定 **1 worker 多线程**：采集任务是进程内后台线程，多进程会破坏任务复用；
-- 状态机转移：`idle → running → success/error`；error 且暂存在 → 续采，
-  否则（含 success 后手动重采）→ 新开一轮并清空旧暂存。
+- 状态机转移：`idle → running → success/error/cancelling`；`cancelling → cancelled`；
+  error 且暂存在 → 续采，否则（含 success/cancelled 后手动重采）→ 新开一轮并清空旧暂存。
+
+### 取消一轮采集的完整生命周期
+
+1. 控制台提交「来源 + 轮次」→ `request_cancel` 在单个写事务内把 `running`
+   置为 `cancelling`（与 `complete_round` 互斥，发布先提交则拒绝取消）；
+2. `HarvestManager` 找到该轮次的 `CancelToken`，置位事件并 **shutdown 在途
+   响应的底层 socket**，阻塞中的慢正文读取立即失败，不等正文结束或读超时；
+3. 采集线程退出抓取循环后执行 `finalize_cancel`：删除本轮暂存、清空令牌，
+   状态才置为 `cancelled`（页面此时才显示「已取消」）；
+4. `cancelling` 期间同源启动被拒绝；`cancelled` 后可从首页新采；
+5. 进程在清理期间重启：启动恢复发现 `cancelling` 会继续完成第 3 步，
+   不会变成可续采的 error；`running` 残留仍按原逻辑转为 error 供续采。
 
 ## 六、测试
 
@@ -102,9 +125,11 @@ merged_catalog     合并视图：归一化 DOI 分组 + 优先来源题名 + �
 PYTHONPATH=.pydeps:. python3 -m unittest discover -s tests -v
 ```
 
-15 个用例覆盖：DOI 归一化与 OAI 解析、全量采集与双源去重、并行与任务复用、
+36 个用例覆盖：DOI 归一化与 OAI 解析、全量采集与双源去重、并行与任务复用、
 撤稿接替、整轮原子交换与查询可见性、网络断点续采、badResumptionToken 清空重采、
-进程重启续采、失败轮次旧目录完好。
+进程重启续采、失败轮次旧目录完好，以及取消专题（`tests/test_cancel.py`）：
+慢正文中断时序、取消/发布双向互斥（含线程级交错）、重复取消幂等、旧页面
+不能取消新轮、取消中拒绝同源启动、清理期间重启继续取消、迟到写入不改新轮。
 
 ## 附录：不使用 Docker 的本地运行
 

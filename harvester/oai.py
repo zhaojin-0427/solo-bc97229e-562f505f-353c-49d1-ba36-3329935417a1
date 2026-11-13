@@ -2,6 +2,7 @@
 
 设计要点：
 - 网络请求在数据库事务之外执行（等待响应不占库写事务）；
+- 响应体分块流式读取：取消受理后可被立即硬中断，不等慢正文结束或读超时；
 - 网络层异常统一包装为 :class:`OaiNetworkError`，可安全重试续采；
 - OAI 协议级 <error> 抛 :class:`OaiError`，badResumptionToken 由上层决策重采。
 """
@@ -13,6 +14,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import requests
 
+from .cancel import CancelToken, HarvestCancelled
 from .doi_utils import looks_like_doi
 
 OAI_NS = "http://www.openarchives.org/OAI/2.0/"
@@ -117,16 +119,45 @@ class OaiClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = (connect_timeout, read_timeout)
 
-    def fetch_page(self, token: str | None = None) -> OaiPage:
+    def fetch_page(
+        self, token: str | None = None, cancel: CancelToken | None = None
+    ) -> OaiPage:
+        """抓取一页。传入 cancel 时，响应体分块读取、块间检查取消事件；
+        取消令牌被触发会硬中断底层连接，本方法随即抛 :class:`HarvestCancelled`，
+        不等慢正文发完，也不等读超时。"""
         url = build_list_records_url(self.base_url, token)
         try:
             resp = requests.get(
                 url,
                 timeout=self.timeout,
+                stream=True,
                 headers={"User-Agent": "library-oai-harvester/1.0"},
             )
         except requests.RequestException as exc:
+            if cancel is not None and cancel.is_set():
+                raise HarvestCancelled() from exc
             raise OaiNetworkError(f"请求失败: {exc.__class__.__name__}: {exc}") from exc
-        if resp.status_code != 200:
-            raise OaiNetworkError(f"上游返回 HTTP {resp.status_code}")
-        return parse_list_records(resp.text)
+        if cancel is not None:
+            cancel.register(resp)
+        try:
+            if cancel is not None and cancel.is_set():
+                raise HarvestCancelled()
+            if resp.status_code != 200:
+                raise OaiNetworkError(f"上游返回 HTTP {resp.status_code}")
+            chunks: list[bytes] = []
+            try:
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if cancel is not None and cancel.is_set():
+                        raise HarvestCancelled()
+                    chunks.append(chunk)
+            except requests.RequestException as exc:
+                # 取消导致的连接中断（IncompleteRead 等）归一为 HarvestCancelled
+                if cancel is not None and cancel.is_set():
+                    raise HarvestCancelled() from exc
+                raise OaiNetworkError(f"读取响应体失败: {exc}") from exc
+            text = b"".join(chunks).decode("utf-8", errors="replace")
+            return parse_list_records(text)
+        finally:
+            if cancel is not None:
+                cancel.unregister(resp)
+            resp.close()

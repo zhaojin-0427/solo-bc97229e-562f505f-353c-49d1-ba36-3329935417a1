@@ -112,7 +112,31 @@ def create_app() -> Flask:
             abort(404)
         action = manager.start(source_id)
         if request.accept_mimetypes.accept_json and not request.form.get("html"):
-            return jsonify({"status": "ok", "action": action, "source_id": source_id})
+            code = 409 if action == "cancelling" else 200
+            return jsonify(
+                {"status": "ok", "action": action, "source_id": source_id}
+            ), code
+        return redirect(url_for("dashboard"))
+
+    @app.post("/harvest/cancel")
+    def harvest_cancel():
+        """取消指定来源的指定轮次（表单必须带页面渲染时的 round_id）。
+
+        受理后：阻止该轮发布、硬中断在途响应；采集退出、暂存与令牌清理
+        完成后状态才变为 cancelled。重复取消返回原结果；旧页面的 round_id
+        与新轮不匹配时拒绝。
+        """
+        source_id = request.form.get("source_id", type=int)
+        round_id = request.form.get("round_id", type=int)
+        if source_id is None or round_id is None:
+            return jsonify(
+                {"ok": False, "error": "缺少 source_id 或 round_id 参数"}
+            ), 400
+        if not any(s["id"] == source_id for s in config.sources):
+            abort(404)
+        result = manager.cancel(source_id, round_id)
+        if request.accept_mimetypes.accept_json and not request.form.get("html"):
+            return jsonify(result), (200 if result["ok"] else 409)
         return redirect(url_for("dashboard"))
 
     # ---------------- JSON API ----------------

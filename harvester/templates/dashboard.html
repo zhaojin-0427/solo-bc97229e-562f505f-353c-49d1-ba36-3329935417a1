@@ -18,8 +18,10 @@
     {% if src.last_success_at %} · 最近完整轮次：{{ src.last_success_at }}{% endif %}</p>
   {% set st = states[loop.index0] %}
   <table>
-    <tr><th style="width:120px">运行状态</th><td><span class="badge b-{{ st.status }}">{{ {'idle':'未采集','running':'采集中','success':'成功','error':'失败可续采'}[st.status] }}</span>
-      {% if running[st.source_id] %}<span class="muted">（后台线程运行中）</span>{% endif %}</td></tr>
+    <tr><th style="width:120px">运行状态</th><td><span class="badge b-{{ st.status }}">{{ {'idle':'未采集','running':'采集中','cancelling':'取消中','cancelled':'已取消','success':'成功','error':'失败可续采'}[st.status] }}</span>
+      {% if running[st.source_id] %}<span class="muted">（后台线程运行中）</span>{% endif %}
+      {% if st.status == 'cancelling' %}<span class="muted">正在中断在途响应并清理本轮暂存…</span>{% endif %}
+      {% if st.status == 'cancelled' %}<span class="muted">本轮已放弃，正式目录保持上次完整轮次</span>{% endif %}</td></tr>
     <tr><th>采集轮次</th><td>#{{ st.round_id }}{% if st.restarts %} · 令牌失效重采 {{ st.restarts }} 次{% endif %}</td></tr>
     <tr><th>进度</th><td>
       第 {{ st.pages_done }} 页 · 已取 {{ st.records_fetched }} 条
@@ -41,11 +43,20 @@
     <form class="inline" method="post" action="{{ url_for('harvest_start') }}">
       <input type="hidden" name="source_id" value="{{ st.source_id }}">
       <input type="hidden" name="html" value="1">
-      <button type="submit" {% if running[st.source_id] %}disabled{% endif %}>
-        {% if running[st.source_id] %}采集中（重复点击将复用任务）{% elif st.status == 'error' %}续采{% elif st.status == 'success' %}重新采集一轮{% else %}启动采集{% endif %}
+      <button type="submit" {% if running[st.source_id] or st.status == 'cancelling' %}disabled{% endif %}>
+        {% if st.status == 'cancelling' %}取消收尾中，暂不能启动{% elif running[st.source_id] %}采集中（重复点击将复用任务）{% elif st.status == 'error' %}续采{% elif st.status == 'success' %}重新采集一轮{% elif st.status == 'cancelled' %}从首页重新采集{% else %}启动采集{% endif %}
       </button>
     </form>
-    <span class="muted">网络失败后点「续采」从断点继续；同源重复启动自动复用同一任务。</span>
+    {% if st.status == 'running' %}
+    <form class="inline" method="post" action="{{ url_for('harvest_cancel') }}"
+          onsubmit="return confirm('确定放弃来源 {{ st.code }} 的第 {{ st.round_id }} 轮采集？\n本轮暂存与令牌将被清除，正式目录保持上次完整轮次。');">
+      <input type="hidden" name="source_id" value="{{ st.source_id }}">
+      <input type="hidden" name="round_id" value="{{ st.round_id }}">
+      <input type="hidden" name="html" value="1">
+      <button type="submit" class="btn-cancel">取消本轮采集（第 {{ st.round_id }} 轮）</button>
+    </form>
+    {% endif %}
+    <span class="muted">网络失败后点「续采」从断点继续；同源重复启动自动复用同一任务；取消按轮次生效，旧页面不能取消新轮。</span>
   </p>
 </div>
 {% endfor %}
